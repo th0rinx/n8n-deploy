@@ -1,87 +1,45 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Log a archivo (si se ejecuta fuera del start script)
-LOGFILE="/var/log/bootstrap-n8n-install.log"
-mkdir -p "$(dirname "$LOGFILE")"
+LOGFILE="/var/log/bootstrap-n8n.log"
+SENTINEL="/var/lib/one-context/.provisioned_n8n"
+
+REPO_URL="https://github.com/th0rinx/n8n-deploy.git"
+REPO_DIR="/opt/n8n-deploy"        # <— carpeta donde clonamos el repo
+BRANCH_OR_TAG="main"              # o un tag, p.ej. v1.0.0
+
+# ==== logging a archivo + consola ====
+mkdir -p "$(dirname "$LOGFILE")" /var/lib/one-context
 exec > >(tee -a "$LOGFILE") 2>&1
+echo "[start-script] $(date -Is) starting…"
 
-log(){ echo "[n8n-setup] $*"; }
+# ==== idempotencia ====
+if [[ -f "$SENTINEL" ]]; then
+  echo "[start-script] sentinel presente; nada que hacer."
+  exit 0
+fi
 
-ENV_FILE="/etc/n8n/n8n.env"
+# ==== prereqs ====
 export DEBIAN_FRONTEND=noninteractive
-
-# --- Paquetes base ---
 apt-get update -y
-apt-get install -y ca-certificates curl gnupg jq
+apt-get install -y git ca-certificates curl gnupg jq
 
-# --- Node.js 22 ---
-if ! command -v node >/dev/null 2>&1; then
-  log "Instalando Node.js 22 (NodeSource)"
-  curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
-  apt-get install -y nodejs
-fi
-log "node: $(node -v)  npm: $(npm -v)"
-
-# --- n8n ---
-if ! command -v n8n >/dev/null 2>&1; then
-  log "Instalando n8n (npm -g)"
-  npm i -g n8n
-fi
-N8N_BIN="$(command -v n8n)"
-log "n8n: $N8N_BIN"
-
-# --- usuario/dirs ---
-id n8n >/dev/null 2>&1 || useradd -r -m -d /var/lib/n8n -s /usr/sbin/nologin n8n
-mkdir -p /var/lib/n8n /var/log/n8n /etc/n8n
-chown -R n8n:n8n /var/lib/n8n /var/log/n8n /etc/n8n
-
-# --- .env ---
-if [[ ! -f "$ENV_FILE" ]]; then
-cat >"$ENV_FILE" <<'EOF'
-N8N_USER_FOLDER=/var/lib/n8n
-N8N_HOST=0.0.0.0
-N8N_PORT=5678
-N8N_PROTOCOL=http
-N8N_DIAGNOSTICS_ENABLED=false
-N8N_PERSONALIZATION_ENABLED=false
-DB_TYPE=sqlite
-DB_SQLITE_POOL_SIZE=5
-N8N_RUNNERS_ENABLED=true
-N8N_BLOCK_ENV_ACCESS_IN_NODE=true
-N8N_GIT_NODE_DISABLE_BARE_REPOS=true
-N8N_SECURE_COOKIE=false
-EOF
-fi
-grep -q '^N8N_ENCRYPTION_KEY=' "$ENV_FILE" || echo "N8N_ENCRYPTION_KEY=$(openssl rand -hex 32)" >> "$ENV_FILE"
-chown n8n:n8n "$ENV_FILE" || true
-
-# --- systemd unit ---
-if ! systemctl cat n8n >/dev/null 2>&1; then
-  cat >/etc/systemd/system/n8n.service <<EOF
-[Unit]
-Description=n8n (Node.js)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=n8n
-Group=n8n
-EnvironmentFile=/etc/n8n/n8n.env
-WorkingDirectory=/var/lib/n8n
-ExecStart=${N8N_BIN}
-Restart=always
-RestartSec=5
-LimitNOFILE=65536
-
-[Install]
-WantedBy=multi-user.target
-EOF
-  systemctl daemon-reload
-  systemctl enable n8n
+# ==== clonar o actualizar repo ====
+if [[ -d "$REPO_DIR/.git" ]]; then
+  echo "[start-script] repo existe, actualizando…"
+  git -C "$REPO_DIR" fetch --all --prune
+  git -C "$REPO_DIR" checkout "$BRANCH_OR_TAG"
+  git -C "$REPO_DIR" pull --ff-only || true
+else
+  echo "[start-script] clonando repo…"
+  git clone --depth=1 --branch "$BRANCH_OR_TAG" "$REPO_URL" "$REPO_DIR"
 fi
 
-# --- start ---
-systemctl restart n8n || systemctl start n8n
-log "OK: n8n escuchando en http://<IP>:5678"
+# ==== ejecutar instalador ====
+chmod +x "$REPO_DIR/install.sh"
+"$REPO_DIR/install.sh"
+
+# ==== marcar como completado ====
+echo "$(date -Is) OK" > "$SENTINEL"
+echo "[start-script] provisioning completado."
+
